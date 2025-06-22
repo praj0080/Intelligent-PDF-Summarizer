@@ -4,11 +4,9 @@ from azure.storage.blob import BlobServiceClient
 import azure.functions as func
 import azure.durable_functions as df
 from azure.identity import DefaultAzureCredential
+from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
-import json
-import time
-from requests import get, post
-import requests
+import openai
 from datetime import datetime
 
 my_app = df.DFApp(http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -24,65 +22,88 @@ async def blob_trigger(myblob: func.InputStream, client):
     blobName = myblob.name.split("/")[1]
     await client.start_new("process_document", client_input=blobName)
 
-# Orchestrator
+# ORCHESTRATOR FUNCTION
 @my_app.orchestration_trigger(context_name="context")
 def process_document(context):
     blobName: str = context.get_input()
+    logging.info(f"📥 Orchestrator started for blob: {blobName}")
 
-    first_retry_interval_in_milliseconds = 5000
-    max_number_of_attempts = 3
-    retry_options = df.RetryOptions(first_retry_interval_in_milliseconds, max_number_of_attempts)
+    retry_options = df.RetryOptions(5000, 3)
 
-    # Download the PDF from Blob Storage and use Document Intelligence Form Recognizer to analyze its contents.
     result = yield context.call_activity_with_retry("analyze_pdf", retry_options, blobName)
-    # Send the analyzed contents to Azure OpenAI to generate a summary.
-    result2 = yield context.call_activity_with_retry("summarize_text",  retry_options, result)
-    # Save the summary to a new file and upload it back to storage.
-    result3 = yield context.call_activity_with_retry("write_doc", retry_options, { "blobName": blobName, "summary": result2 })
+    logging.info("✅ PDF analysis completed.")
 
-    return logging.info(f"Successfully uploaded summary to {result3}")
+    result2 = yield context.call_activity_with_retry("summarize_text", retry_options, result)
+    logging.info("✅ Text summarization completed.")
 
+    result3 = yield context.call_activity_with_retry("write_doc", retry_options, {
+        "blobName": blobName,
+        "summary": result2
+    })
+    logging.info(f"✅ Summary written to blob: {result3}")
+    return f"Successfully uploaded summary as {result3}"
+
+# ACTIVITY: Analyze PDF using Form Recognizer
 @my_app.activity_trigger(input_name='blobName')
 def analyze_pdf(blobName):
-    logging.info(f"in analyze_text activity")
-    global blob_service_client
+    logging.info(f"🔍 Analyzing PDF: {blobName}")
     container_client = blob_service_client.get_container_client("input")
     blob_client = container_client.get_blob_client(blobName)
-    blob =  blob_client.download_blob().read()
-    doc = ''
+    blob = blob_client.download_blob().read()
 
+    key = os.environ["COGNITIVE_SERVICES_KEY"]
     endpoint = os.environ["COGNITIVE_SERVICES_ENDPOINT"]
-    credential = DefaultAzureCredential()
-
+    credential = AzureKeyCredential(key)
     document_analysis_client = DocumentAnalysisClient(endpoint, credential)
 
     poller = document_analysis_client.begin_analyze_document("prebuilt-layout", document=blob, locale="en-US")
     result = poller.result().pages
 
+    doc = ""
     for page in result:
         for line in page.lines:
-            doc += line.content
+            doc += line.content + " "
 
+    logging.info(f"📄 Extracted {len(doc)} characters from PDF.")
     return doc
 
+# ACTIVITY: Summarize Text using Azure OpenAI
 @my_app.activity_trigger(input_name='results')
-@my_app.generic_input_binding(arg_name="response", type="textCompletion", data_type=func.DataType.STRING, prompt="Can you explain what the following text is about? {results}", model = "%CHAT_MODEL_DEPLOYMENT_NAME%")
-def summarize_text(results, response: str):
-    logging.info(f"in summarize_text activity")
-    response_json = json.loads(response)
-    logging.info(response_json['content'])
-    return response_json
+def summarize_text(results):
+    logging.info("⚠️ Mocking summarization due to Azure OpenAI quota limits.")
+    mock_summary = "This is a mock summary of the uploaded PDF document. Replace this with actual output once your Azure OpenAI quota is approved."
+    return {"content": mock_summary}
 
+# ACTIVITY: Save Summary to Output Blob
 @my_app.activity_trigger(input_name='results')
 def write_doc(results):
-    logging.info(f"in write_doc activity")
-    global blob_service_client
-    container_client=blob_service_client.get_container_client("output")
+    logging.info("💾 Saving summary to 'output' blob container.")
+    container_client = blob_service_client.get_container_client("output")
 
-    summary = results['blobName'] + "-" + str(datetime.now())
-    sanitizedSummary = summary.replace(".", "-")
-    fileName = sanitizedSummary + ".txt"
+    summary_name = results['blobName'] + "-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    fileName = summary_name + ".txt"
 
-    logging.info("uploading to blob" + results['summary']['content'])
-    container_client.upload_blob(name=fileName, data=results['summary']['content'])
-    return str(summary + ".txt")
+    container_client.upload_blob(name=fileName, data=results['summary']['content'], overwrite=True)
+    logging.info(f"✅ Summary saved as: {fileName}")
+    return fileName
+
+@app.route(route="TestHttp", auth_level=func.AuthLevel.FUNCTION)
+def TestHttp(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Python HTTP trigger function processed a request.')
+
+    name = req.params.get('name')
+    if not name:
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            pass
+        else:
+            name = req_body.get('name')
+
+    if name:
+        return func.HttpResponse(f"Hello, {name}. This HTTP triggered function executed successfully.")
+    else:
+        return func.HttpResponse(
+             "This HTTP triggered function executed successfully. Pass a name in the query string or in the request body for a personalized response.",
+             status_code=200
+        )
